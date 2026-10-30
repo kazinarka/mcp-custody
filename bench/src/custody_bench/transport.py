@@ -59,14 +59,21 @@ class McpTransport:
     """Tools over MCP stdio. `{server}` in the command expands to the bench server invocation,
     so a gateway can wrap it, e.g. `custody -- {server}`."""
 
-    def __init__(self, suite: TaskSuite, version: str, command: str) -> None:
+    def __init__(
+        self, suite: TaskSuite, version: str, command: str, daemon: str | None = None
+    ) -> None:
         self.suite = suite
         self._tmp = tempfile.TemporaryDirectory(prefix="custody-bench-")
         self.control_path = str(Path(self._tmp.name) / "control.sock")
-        server = shlex.join(
-            [sys.executable, "-m", "custody_bench.server", "--suite", suite.name,
-             "--version", version, "--control", self.control_path]
-        )
+        if daemon is None:
+            server = shlex.join(
+                [sys.executable, "-m", "custody_bench.server", "--suite", suite.name,
+                 "--version", version, "--control", self.control_path]
+            )
+        else:
+            server = shlex.join(
+                [sys.executable, "-m", "custody_bench.attach", daemon, self.control_path]
+            )
         argv = shlex.split(command.replace("{server}", server))
         self.params = StdioServerParameters(command=argv[0], args=argv[1:])
         self._stack = AsyncExitStack()
@@ -113,3 +120,30 @@ class McpTransport:
     async def finish(self) -> tuple[TaskEnvironment, list[FunctionCall]]:
         resp = await self._control({"op": "dump"})
         return env_from_wire(resp["env"]), [call_from_json(c) for c in resp["trace"]]
+
+
+class ServerDaemon:
+    """A preloaded bench server that forks one session per connection (server.py --daemon)."""
+
+    def __init__(self, suite: TaskSuite, version: str) -> None:
+        self._tmp = tempfile.TemporaryDirectory(prefix="custody-bench-daemon-")
+        self.path = str(Path(self._tmp.name) / "daemon.sock")
+        self._argv = [sys.executable, "-m", "custody_bench.server", "--suite", suite.name,
+                      "--version", version, "--daemon", self.path]
+        self._proc: asyncio.subprocess.Process | None = None
+
+    async def __aenter__(self) -> "ServerDaemon":
+        self._proc = await asyncio.create_subprocess_exec(*self._argv)
+        for _ in range(600):
+            if Path(self.path).exists():
+                return self
+            if self._proc.returncode is not None:
+                break
+            await asyncio.sleep(0.05)
+        raise RuntimeError("bench server daemon did not start")
+
+    async def __aexit__(self, *exc: object) -> None:
+        if self._proc is not None and self._proc.returncode is None:
+            self._proc.terminate()
+            await self._proc.wait()
+        self._tmp.cleanup()

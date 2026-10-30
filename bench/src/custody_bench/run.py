@@ -25,7 +25,7 @@ from agentdojo.types import text_content_block_from_string
 from .agents import AGENTS, plan
 from .policy import LEVELS, generate
 from .suite import DEFAULT_VERSION, call_to_json, load_suite
-from .transport import DirectTransport, McpTransport, Transport
+from .transport import DirectTransport, McpTransport, ServerDaemon, Transport
 
 
 class _ScriptedPipeline(BasePipelineElement):
@@ -95,25 +95,28 @@ async def cmd_run(args: argparse.Namespace) -> int:
     else:
         pairs = [(u, i) for u in user_tasks for i in injection_tasks]
 
-    out = open(args.out, "w") if args.out else None
-    results = []
     started = time.monotonic()
-    async with AsyncExitStack() as stack:
-        transport: Transport
+    jobs = asyncio.Semaphore(args.jobs)
+
+    async def episode(user_task: BaseUserTask, injection_task: BaseInjectionTask | None):
+        injections = attack.attack(user_task, injection_task) if attack and injection_task else {}
         if args.transport == "direct":
             transport = DirectTransport(suite)
-        else:
-            transport = await stack.enter_async_context(
-                McpTransport(suite, args.version, args.command)
-            )
-        for user_task, injection_task in pairs:
-            injections = attack.attack(user_task, injection_task) if attack and injection_task else {}
-            r = await run_episode(suite, transport, args.agent, user_task, injection_task, injections)
-            results.append(r)
-            if out:
-                out.write(json.dumps(r) + "\n")
-    if out:
-        out.close()
+            return await run_episode(suite, transport, args.agent, user_task, injection_task, injections)
+        # One server and gateway process per episode: a gateway process is one session, and
+        # session state such as taint must not carry over from the previous episode.
+        name = f"{user_task.ID}--{injection_task.ID if injection_task else 'none'}"
+        command = args.command.replace("{episode}", name)
+        async with jobs, McpTransport(suite, args.version, command, daemon.path) as transport:
+            return await run_episode(suite, transport, args.agent, user_task, injection_task, injections)
+
+    async with AsyncExitStack() as stack:
+        if args.transport == "mcp":
+            daemon = await stack.enter_async_context(ServerDaemon(suite, args.version))
+        results = await asyncio.gather(*(episode(u, i) for u, i in pairs))
+    if args.out:
+        with open(args.out, "w") as out:
+            out.writelines(json.dumps(r) + "\n" for r in results)
 
     n = len(results)
     utility = sum(r["utility"] for r in results)
@@ -126,6 +129,9 @@ async def cmd_run(args: argparse.Namespace) -> int:
     print(f"calls      planned {sum(r['planned'] for r in results)}, "
           f"executed {sum(r['executed'] for r in results)}, "
           f"errors {sum(r['errors'] for r in results)}")
+    # With the scripted agents a tool error can only be a gateway refusal.
+    refused = [r for r in results if r["errors"]]
+    print(f"refused    {sum(r['errors'] for r in refused)} calls in {len(refused)}/{n} episodes")
     return 0
 
 
@@ -163,7 +169,9 @@ def main() -> None:
     run.add_argument("--attack", default="none", help="AgentDojo attack name, or none")
     run.add_argument("--transport", choices=("direct", "mcp"), default="direct")
     run.add_argument("--command", default="{server}",
-                     help="stdio command for --transport mcp; {server} is the bench server")
+                     help="stdio command for --transport mcp; {server} is the bench server, "
+                          "{episode} a per-episode name (for log paths)")
+    run.add_argument("--jobs", type=int, default=4, help="episodes in parallel (mcp transport)")
     run.add_argument("--tasks", action="append", help="user task id or glob, repeatable")
     run.add_argument("--injection-tasks", action="append", help="injection task id or glob")
     run.add_argument("--out", help="write per-episode results as JSON lines")

@@ -8,7 +8,7 @@ use serde_json::{Map, Value};
 
 use crate::jsonrpc;
 use crate::pins::{PinEvent, Pins};
-use crate::policy::{Denial, PinMode, Policy};
+use crate::policy::{Denial, PinMode, Policy, Source, TaintMode};
 
 /// What the agent reads when a call is refused. Deliberately uninformative: the reason goes
 /// to the audit log, not to a model that may be steered by an attacker probing the policy.
@@ -25,9 +25,19 @@ pub enum Verdict {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "finding", rename_all = "snake_case")]
 pub enum Finding {
-    Denied { denial: Denial },
-    Pin { event: PinEvent },
-    Unsupported { reason: String },
+    Denied {
+        denial: Denial,
+    },
+    Pin {
+        event: PinEvent,
+    },
+    /// The session saw untrusted output for the first time.
+    Tainted {
+        by: String,
+    },
+    Unsupported {
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -45,9 +55,10 @@ impl Decision {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 enum Pending {
     ToolsList,
+    ToolCall { tool: String },
 }
 
 #[derive(Debug)]
@@ -57,6 +68,9 @@ pub struct Gateway {
     pending: HashMap<String, Pending>,
     /// From `initialize`, for clients on revisions before per-request versions.
     session_version: Option<String>,
+    /// The first untrusted tool whose output reached this session. A gateway instance is one
+    /// session: for stdio, the lifetime of the server process.
+    tainted_by: Option<String>,
 }
 
 impl Gateway {
@@ -66,11 +80,16 @@ impl Gateway {
             pins,
             pending: HashMap::new(),
             session_version: None,
+            tainted_by: None,
         }
     }
 
     pub fn pins(&self) -> &Pins {
         &self.pins
+    }
+
+    pub fn tainted_by(&self) -> Option<&str> {
+        self.tainted_by.as_deref()
     }
 
     pub fn client_frame(&mut self, msg: &Value) -> Decision {
@@ -98,7 +117,13 @@ impl Gateway {
                 Decision::forward()
             }
             Some("tools/call") => match self.check_call(msg) {
-                Ok(()) => Decision::forward(),
+                Ok(tool) => {
+                    if let Some(id) = jsonrpc::id(msg) {
+                        self.pending
+                            .insert(jsonrpc::id_key(id), Pending::ToolCall { tool });
+                    }
+                    Decision::forward()
+                }
                 Err(denial) => self.deny(msg, denial),
             },
             _ => Decision::forward(),
@@ -113,23 +138,37 @@ impl Gateway {
         let Some(id) = jsonrpc::id(msg) else {
             return decision;
         };
-        if let Some(Pending::ToolsList) = self.pending.remove(&jsonrpc::id_key(id))
-            && let Some(tools) = msg
-                .get("result")
-                .and_then(|r| r.get("tools"))
-                .and_then(Value::as_array)
-        {
-            decision.findings.extend(
-                self.pins
-                    .observe(tools)
-                    .into_iter()
-                    .map(|event| Finding::Pin { event }),
-            );
+        match self.pending.remove(&jsonrpc::id_key(id)) {
+            Some(Pending::ToolsList) => {
+                if let Some(tools) = msg
+                    .get("result")
+                    .and_then(|r| r.get("tools"))
+                    .and_then(Value::as_array)
+                {
+                    decision.findings.extend(
+                        self.pins
+                            .observe(tools)
+                            .into_iter()
+                            .map(|event| Finding::Pin { event }),
+                    );
+                }
+            }
+            // Error results count too: an error message can carry the server's text as well.
+            Some(Pending::ToolCall { tool })
+                if self.tainted_by.is_none() && self.policy.source(&tool) == Source::Untrusted =>
+            {
+                decision
+                    .findings
+                    .push(Finding::Tainted { by: tool.clone() });
+                self.tainted_by = Some(tool);
+            }
+            Some(Pending::ToolCall { .. }) | None => {}
         }
         decision
     }
 
-    fn check_call(&self, msg: &Value) -> Result<(), Denial> {
+    /// Returns the tool name if the call may go through.
+    fn check_call(&self, msg: &Value) -> Result<String, Denial> {
         let malformed = |reason: &str| Denial::Malformed {
             reason: reason.into(),
         };
@@ -149,7 +188,19 @@ impl Gateway {
                 tool: tool.to_owned(),
             });
         }
-        self.policy.check_call(tool, args)
+        self.policy.check_call(tool, args)?;
+        if let Some(by) = &self.tainted_by
+            && self.policy.is_sink(tool)
+        {
+            let (tool, tainted_by) = (tool.to_owned(), by.clone());
+            match self.policy.taint.mode {
+                TaintMode::Off => {}
+                TaintMode::Deny => return Err(Denial::TaintedSink { tool, tainted_by }),
+                // No approval channel yet: refused, but recorded as a question to a human.
+                TaintMode::Ask => return Err(Denial::ApprovalRequired { tool, tainted_by }),
+            }
+        }
+        Ok(tool.to_owned())
     }
 
     fn deny(&self, msg: &Value, denial: Denial) -> Decision {
@@ -286,6 +337,94 @@ mod tests {
         let mut g = gateway("");
         let d = g.server_frame(&list_result(99, "Send money."));
         assert!(d.findings.is_empty());
+    }
+
+    fn result(id: i64) -> Value {
+        json!({"jsonrpc": "2.0", "id": id, "result": {"content": []}})
+    }
+
+    const TAINT: &str = r#"
+        [taint]
+        mode = "deny"
+        [tools.get_balance]
+        source = "trusted"
+        [tools.send_money]
+        sink = true
+        source = "trusted"
+    "#;
+
+    #[test]
+    fn sink_is_allowed_until_untrusted_output_arrives() {
+        let mut g = gateway(TAINT);
+        assert_eq!(
+            g.client_frame(&call(1, "get_balance", json!({}))).verdict,
+            Verdict::Forward
+        );
+        assert!(g.server_frame(&result(1)).findings.is_empty());
+        assert_eq!(
+            g.client_frame(&call(2, "send_money", json!({}))).verdict,
+            Verdict::Forward
+        );
+        g.server_frame(&result(2));
+
+        g.client_frame(&call(3, "read_file", json!({})));
+        let d = g.server_frame(&result(3));
+        assert_eq!(
+            d.findings,
+            vec![Finding::Tainted {
+                by: "read_file".into()
+            }]
+        );
+        assert_eq!(g.tainted_by(), Some("read_file"));
+
+        let d = g.client_frame(&call(4, "send_money", json!({})));
+        assert!(matches!(d.verdict, Verdict::Reply(_)));
+        assert!(matches!(
+            d.findings[..],
+            [Finding::Denied {
+                denial: Denial::TaintedSink { .. }
+            }]
+        ));
+        // Non-sinks keep working.
+        assert_eq!(
+            g.client_frame(&call(5, "get_balance", json!({}))).verdict,
+            Verdict::Forward
+        );
+    }
+
+    #[test]
+    fn ask_mode_records_an_approval_request() {
+        let mut g = gateway(&TAINT.replace("\"deny\"", "\"ask\""));
+        g.client_frame(&call(1, "read_file", json!({})));
+        g.server_frame(&result(1));
+        let d = g.client_frame(&call(2, "send_money", json!({})));
+        assert!(matches!(
+            d.findings[..],
+            [Finding::Denied {
+                denial: Denial::ApprovalRequired { .. }
+            }]
+        ));
+    }
+
+    #[test]
+    fn taint_is_only_set_by_results_of_calls_that_were_made() {
+        let mut g = gateway(TAINT);
+        // A response to an id nobody used, and a response to a refused call, change nothing.
+        g.server_frame(&result(42));
+        g.client_frame(&call(1, "send_money", json!("bad args")));
+        g.server_frame(&result(1));
+        assert_eq!(g.tainted_by(), None);
+    }
+
+    #[test]
+    fn taint_off_never_blocks() {
+        let mut g = gateway(&TAINT.replace("mode = \"deny\"", "mode = \"off\""));
+        g.client_frame(&call(1, "read_file", json!({})));
+        g.server_frame(&result(1));
+        assert_eq!(
+            g.client_frame(&call(2, "send_money", json!({}))).verdict,
+            Verdict::Forward
+        );
     }
 
     #[test]

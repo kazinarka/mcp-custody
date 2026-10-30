@@ -1,10 +1,12 @@
-"""Generate L0 policies for a suite from its user tasks only. Injection tasks are never read,
+"""Generate policies for a suite from its user tasks only. Injection tasks are never read,
 so a policy cannot be tuned to the attacks it is scored against.
 
 - tools: least privilege. Only tools some user task needs are allowed.
 - args: tools, plus every sink argument limited to the values user tasks use. This is an
   oracle (an operator who knows every legitimate recipient in advance), so it is an upper
   bound for static allowlists, not a realistic deployment.
+- taint: tools, plus session taint (L1) in "ask" mode: once output from a tool not marked
+  trusted reaches the session, every sink call needs approval.
 """
 
 import json
@@ -13,7 +15,7 @@ from urllib.parse import urlsplit
 
 from agentdojo.task_suite.task_suite import TaskSuite
 
-LEVELS = ("tools", "args")
+LEVELS = ("tools", "args", "taint")
 
 # Arguments that choose where an action goes or what it acts on (threat model section 6),
 # picked from tool signatures. "hosts" arguments are URLs constrained by host.
@@ -56,6 +58,29 @@ SINKS: dict[str, dict[str, dict[str, str]]] = {
 }
 
 
+# Tools whose output cannot contain text written by a third party: the user's own balance,
+# identifiers and profile, and the clock. Everything else defaults to untrusted.
+TRUSTED_SOURCES: dict[str, set[str]] = {
+    "banking": {"get_iban", "get_balance", "get_user_info"},
+    "slack": set(),
+    "travel": {"get_user_information"},
+    "workspace": {"get_current_day"},
+}
+
+# Tools with side effects or egress. Superset of SINKS: some write tools have no selector
+# argument worth constraining but still act on the world.
+EXTRA_SINKS: dict[str, set[str]] = {
+    "banking": {"update_user_info"},
+    "slack": set(),
+    "travel": set(),
+    "workspace": {"create_file", "append_to_file"},
+}
+
+
+def sink_tools(suite_name: str) -> set[str]:
+    return set(SINKS[suite_name]) | EXTRA_SINKS[suite_name]
+
+
 def _host(url: str) -> str:
     parts = urlsplit(url if "://" in url else f"https://{url}")
     return (parts.hostname or "").lower()
@@ -87,8 +112,15 @@ def generate(suite: TaskSuite, level: str) -> str:
         'default = "deny"',
         "",
     ]
+    if level == "taint":
+        lines += ["[taint]", 'mode = "ask"', 'default_source = "untrusted"', ""]
     for tool in sorted(tools):
         lines.append(f"[tools.{tool}]")
+        if level == "taint":
+            if tool in TRUSTED_SOURCES[suite.name]:
+                lines.append('source = "trusted"')
+            if tool in sink_tools(suite.name):
+                lines.append("sink = true")
         if level == "args":
             for arg, kind in sinks.get(tool, {}).items():
                 key = "hosts" if kind == "hosts" else "one_of"

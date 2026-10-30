@@ -8,7 +8,7 @@ from agentdojo.attacks.attack_registry import load_attack
 
 from custody_bench.run import _ScriptedPipeline, run_episode
 from custody_bench.suite import DEFAULT_VERSION, load_suite
-from custody_bench.transport import DirectTransport, McpTransport
+from custody_bench.transport import DirectTransport, McpTransport, ServerDaemon
 
 RELAY = Path(__file__).with_name("blocking_relay.py")
 
@@ -56,6 +56,20 @@ def test_mcp_matches_direct(suite_name, users, injections):
         run_all(lambda s: McpTransport(s, DEFAULT_VERSION, "{server}"), items)
     )
     assert direct == mcp
+
+
+def test_forked_daemon_matches_direct():
+    items = list(episodes("workspace", ["user_task_1"], ["injection_task_0", "injection_task_3"]))
+    suite = items[0][0]
+    direct = asyncio.run(run_all(_Direct, items))
+
+    async def via_daemon():
+        async with ServerDaemon(suite, DEFAULT_VERSION) as daemon:
+            return await run_all(
+                lambda s: McpTransport(s, DEFAULT_VERSION, "{server}", daemon.path), items
+            )
+
+    assert asyncio.run(via_daemon()) == direct
 
 
 def test_blocked_call_is_not_scored():

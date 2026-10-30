@@ -14,8 +14,9 @@ modified.
 
 ## Status
 
-Early. The gateway relays MCP stdio traffic, enforces a static (L0) policy on tool calls, pins
-tool definitions on first sight, and writes a hash-chained audit log. The threat model is in
+Early. The gateway relays MCP stdio traffic, enforces a static (L0) policy on tool calls,
+tracks session taint (L1), pins tool definitions on first sight, and writes a hash-chained
+audit log. The threat model is in
 [docs/threat-model.md](docs/threat-model.md), the evaluation harness in [bench/](bench/).
 
 ```
@@ -43,7 +44,20 @@ one_of = ["GB29NWBK60161331926819"]
 
 [tools.get_webpage.args.url]
 hosts = ["www.informations.com", "*.example.org"]
+
+[taint]
+mode = "ask"                      # off | deny | ask
+default_source = "untrusted"      # for tools that do not say
+
+[tools.get_balance]
+source = "trusted"                # output cannot carry third-party text
+
+[tools.send_money]
+sink = true                       # refused or asked about once the session is tainted
 ```
+
+A session is one gateway process. In `ask` mode a tainted sink call is currently refused and
+recorded as an approval request; delivering the question to a human is not implemented yet.
 
 Results per enforcement level are in [bench/README.md](bench/README.md).
 

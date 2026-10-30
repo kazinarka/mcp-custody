@@ -1,4 +1,5 @@
-//! Static (L0) policy: which tools may be called and which argument values are acceptable.
+//! Policy: which tools may be called, which argument values are acceptable (L0), and how
+//! untrusted tool output restricts later calls (L1, session taint).
 //!
 //! ```toml
 //! default = "deny"            # tools not listed below
@@ -13,6 +14,16 @@
 //!
 //! [tools.get_webpage.args.url]
 //! hosts = ["www.informations.com", "*.example.org"]
+//!
+//! [taint]
+//! mode = "ask"                # off | deny | ask
+//! default_source = "untrusted"
+//!
+//! [tools.get_balance]
+//! source = "trusted"          # output cannot carry third-party text
+//!
+//! [tools.send_money]
+//! sink = true                 # needs approval once the session is tainted
 //! ```
 
 use std::collections::BTreeMap;
@@ -47,7 +58,40 @@ pub struct Policy {
     #[serde(default)]
     pub pinning: PinMode,
     #[serde(default)]
+    pub taint: Taint,
+    #[serde(default)]
     pub tools: BTreeMap<String, ToolRule>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TaintMode {
+    /// No session taint (L0 only).
+    #[default]
+    Off,
+    /// Sink calls in a tainted session are refused.
+    Deny,
+    /// Sink calls in a tainted session need a human's approval.
+    Ask,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Source {
+    Trusted,
+    /// Output may contain text written by someone other than the user.
+    #[default]
+    Untrusted,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Taint {
+    #[serde(default)]
+    pub mode: TaintMode,
+    /// For tools that do not declare `source`. Untrusted unless stated otherwise.
+    #[serde(default)]
+    pub default_source: Source,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -57,6 +101,10 @@ pub struct ToolRule {
     pub action: Action,
     #[serde(default)]
     pub args: BTreeMap<String, ArgRule>,
+    pub source: Option<Source>,
+    /// Acts on the world or sends data out.
+    #[serde(default)]
+    pub sink: bool,
 }
 
 /// Constraints apply to every element when the argument is an array. An absent argument is
@@ -84,11 +132,26 @@ pub enum Denial {
     Pinned { tool: String },
     #[error("malformed tools/call: {reason}")]
     Malformed { reason: String },
+    #[error("sink {tool} in a session tainted by {tainted_by}")]
+    TaintedSink { tool: String, tainted_by: String },
+    #[error("sink {tool} in a session tainted by {tainted_by} needs approval")]
+    ApprovalRequired { tool: String, tainted_by: String },
 }
 
 impl Policy {
     pub fn from_toml(text: &str) -> Result<Self, toml::de::Error> {
         toml::from_str(text)
+    }
+
+    pub fn source(&self, tool: &str) -> Source {
+        self.tools
+            .get(tool)
+            .and_then(|r| r.source)
+            .unwrap_or(self.taint.default_source)
+    }
+
+    pub fn is_sink(&self, tool: &str) -> bool {
+        self.tools.get(tool).is_some_and(|r| r.sink)
     }
 
     pub fn check_call(&self, tool: &str, args: &Map<String, Value>) -> Result<(), Denial> {
@@ -232,6 +295,27 @@ mod tests {
         assert!(url("evilexample.org").is_err());
         assert!(url("www.informations.com.evil.net").is_err());
         assert!(url("https://evil.net/?www.informations.com").is_err());
+    }
+
+    #[test]
+    fn taint_labels_and_defaults() {
+        let policy = Policy::from_toml(
+            r#"
+            [taint]
+            mode = "ask"
+            [tools.get_balance]
+            source = "trusted"
+            [tools.send_money]
+            sink = true
+            "#,
+        )
+        .unwrap();
+        assert_eq!(policy.taint.mode, TaintMode::Ask);
+        assert_eq!(policy.source("get_balance"), Source::Trusted);
+        assert_eq!(policy.source("read_file"), Source::Untrusted);
+        assert!(policy.is_sink("send_money"));
+        assert!(!policy.is_sink("get_balance"));
+        assert_eq!(Policy::default().taint.mode, TaintMode::Off);
     }
 
     #[test]

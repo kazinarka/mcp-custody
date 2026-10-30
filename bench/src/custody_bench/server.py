@@ -8,6 +8,9 @@ this process are recorded in the trace used for scoring.
 import argparse
 import asyncio
 import json
+import os
+import signal
+import socket
 import sys
 from typing import Any
 
@@ -96,22 +99,60 @@ async def serve_control(state: SuiteState, path: str) -> asyncio.Server:
     return await asyncio.start_unix_server(handle, path=path, limit=64 * 1024 * 1024)
 
 
-async def main_async(args: argparse.Namespace) -> None:
-    state = SuiteState(args.suite, args.version)
-    control = await serve_control(state, args.control)
+async def serve(state: SuiteState, control_path: str) -> None:
+    control = await serve_control(state, control_path)
     server = build_server(state)
     async with control, stdio_server() as (read_stream, write_stream):
         await server.run(read_stream, write_stream, server.create_initialization_options())
+
+
+def serve_forked(suite_name: str, version: str, daemon_path: str) -> None:
+    """Load the suite once, then fork a fresh server per connection.
+
+    Importing AgentDojo takes seconds; forking an already loaded process takes milliseconds.
+    Each connection starts with one JSON line naming its control socket, then speaks MCP.
+    See attach.py for the client side.
+    """
+    state = SuiteState(suite_name, version)
+    signal.signal(signal.SIGCHLD, signal.SIG_IGN)  # children are reaped automatically
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(daemon_path)
+    listener.listen(64)
+    while True:
+        conn, _ = listener.accept()
+        if os.fork() != 0:
+            conn.close()
+            continue
+        listener.close()
+        signal.signal(signal.SIGCHLD, signal.SIG_DFL)
+        # Byte by byte: a buffered reader would also swallow the start of the MCP stream.
+        hello = bytearray()
+        while not hello.endswith(b"\n") and (byte := conn.recv(1)):
+            hello += byte
+        control_path = json.loads(hello)["control"]
+        # The MCP stdio transport reads fd 0 and writes fd 1; point both at the connection.
+        os.dup2(conn.fileno(), 0)
+        os.dup2(conn.fileno(), 1)
+        conn.close()
+        try:
+            asyncio.run(serve(state, control_path))
+        finally:
+            os._exit(0)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--suite", required=True)
     parser.add_argument("--version", default=DEFAULT_VERSION)
-    parser.add_argument("--control", required=True, help="Unix socket path for seed/dump")
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--control", help="Unix socket path for seed/dump; serve one session")
+    mode.add_argument("--daemon", help="Unix socket path to accept sessions on (see attach.py)")
     args = parser.parse_args()
     try:
-        asyncio.run(main_async(args))
+        if args.daemon:
+            serve_forked(args.suite, args.version, args.daemon)
+        else:
+            asyncio.run(serve(SuiteState(args.suite, args.version), args.control))
     except KeyboardInterrupt:
         sys.exit(130)
 

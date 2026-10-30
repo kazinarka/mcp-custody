@@ -2,3 +2,8 @@
 .idea/
 .vscode/
 .DS_Store
+.env
+.venv/
+__pycache__/
+/bench/results/
+.pytest_cache/

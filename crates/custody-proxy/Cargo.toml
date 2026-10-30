@@ -1,0 +1,19 @@
+[package]
+name = "custody-proxy"
+description = "MCP gateway that enforces custody-core decisions on tool traffic."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "custody"
+path = "src/main.rs"
+
+[dependencies]
+custody-core = { path = "../custody-core" }
+
+[lints]
+workspace = true

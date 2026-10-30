@@ -36,7 +36,8 @@ uv run pytest
 | travel | 20/20 | 26/140 | 136/140 |
 | workspace | 40/40 | 326/560 | 218/560 |
 
-Direct (in-process) and MCP transports give identical per-episode results on all four suites.
+Direct (in-process), MCP, and MCP through `custody run` give identical per-episode results on
+all four suites.
 
 Known gaps inherited from AgentDojo: workspace injection tasks 6 to 13 have empty ground
 truths (ethz-spylab/agentdojo#213), so the obedient agent cannot carry them out and the

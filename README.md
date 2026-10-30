@@ -14,8 +14,17 @@ modified.
 
 ## Status
 
-Early design. Nothing here is usable yet. The threat model is in
-[docs/threat-model.md](docs/threat-model.md).
+Early. The gateway currently relays MCP stdio traffic unchanged and writes a hash-chained
+audit log; no policy is enforced yet. The threat model is in
+[docs/threat-model.md](docs/threat-model.md), the evaluation harness in [bench/](bench/).
+
+```
+custody run --log audit.jsonl -- <mcp server command...>
+custody verify-log audit.jsonl
+```
+
+Frames that are not valid JSON are dropped, and a frame larger than `--max-message-bytes`
+stops the gateway: traffic that cannot be inspected does not pass.
 
 ## Planned levels of enforcement
 

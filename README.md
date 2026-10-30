@@ -14,17 +14,38 @@ modified.
 
 ## Status
 
-Early. The gateway currently relays MCP stdio traffic unchanged and writes a hash-chained
-audit log; no policy is enforced yet. The threat model is in
+Early. The gateway relays MCP stdio traffic, enforces a static (L0) policy on tool calls, pins
+tool definitions on first sight, and writes a hash-chained audit log. The threat model is in
 [docs/threat-model.md](docs/threat-model.md), the evaluation harness in [bench/](bench/).
 
 ```
-custody run --log audit.jsonl -- <mcp server command...>
+custody run --policy policy.toml --pins pins.json --log audit.jsonl -- <mcp server command...>
 custody verify-log audit.jsonl
 ```
 
 Frames that are not valid JSON are dropped, and a frame larger than `--max-message-bytes`
-stops the gateway: traffic that cannot be inspected does not pass.
+stops the gateway: traffic that cannot be inspected does not pass. A refused call gets a tool
+error with a fixed text; the reason is written to the audit log only. A tool whose definition
+changed after it was pinned cannot be called until the pin is removed.
+
+Policy format:
+
+```toml
+default = "deny"                  # tools not listed
+
+[tools.get_balance]               # allowed, no argument rules
+
+[tools.update_password]
+action = "deny"
+
+[tools.send_money.args.recipient]
+one_of = ["GB29NWBK60161331926819"]
+
+[tools.get_webpage.args.url]
+hosts = ["www.informations.com", "*.example.org"]
+```
+
+Results per enforcement level are in [bench/README.md](bench/README.md).
 
 ## Planned levels of enforcement
 

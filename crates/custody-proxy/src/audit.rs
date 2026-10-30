@@ -27,6 +27,10 @@ pub enum Event {
     Message { dir: Direction, msg: Value },
     /// Not forwarded.
     Rejected { dir: Direction, reason: String },
+    /// Sent to the client by the gateway in place of the server.
+    Reply { msg: Value },
+    /// A gateway decision about the preceding message.
+    Finding { finding: custody_core::Finding },
     /// The downstream server exited; `code` is `None` when it was killed by a signal.
     Exit { code: Option<i32> },
 }

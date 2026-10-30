@@ -3,6 +3,7 @@
     custody-bench run --suite banking --agent obedient --attack direct --transport mcp
     custody-bench run ... --transport mcp --command 'custody -- {server}'
     custody-bench diff a.jsonl b.jsonl
+    custody-bench policy --suite banking --level args -o banking.toml
 """
 
 import argparse
@@ -22,6 +23,7 @@ from agentdojo.task_suite.task_suite import TaskSuite
 from agentdojo.types import text_content_block_from_string
 
 from .agents import AGENTS, plan
+from .policy import LEVELS, generate
 from .suite import DEFAULT_VERSION, call_to_json, load_suite
 from .transport import DirectTransport, McpTransport, Transport
 
@@ -170,9 +172,18 @@ def main() -> None:
     diff.add_argument("a")
     diff.add_argument("b")
 
+    policy = sub.add_parser("policy", help="generate an L0 policy from user tasks")
+    policy.add_argument("--suite", required=True)
+    policy.add_argument("--version", default=DEFAULT_VERSION)
+    policy.add_argument("--level", choices=LEVELS, required=True)
+    policy.add_argument("-o", "--out", required=True)
+
     args = parser.parse_args()
     if args.cmd == "run":
         sys.exit(asyncio.run(cmd_run(args)))
+    if args.cmd == "policy":
+        Path(args.out).write_text(generate(load_suite(args.suite, args.version), args.level))
+        sys.exit(0)
     sys.exit(cmd_diff(args))
 
 

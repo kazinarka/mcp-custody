@@ -7,6 +7,8 @@ use std::process::ExitCode;
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 
+use custody_core::{Gateway, Pins, Policy};
+
 use crate::audit::Audit;
 
 #[derive(Debug, Parser)]
@@ -27,6 +29,12 @@ enum Cmd {
         /// Write a hash-chained audit log here. The file must not exist.
         #[arg(long)]
         log: Option<PathBuf>,
+        /// TOML policy. Without one every call is allowed, but tool pins are still enforced.
+        #[arg(long)]
+        policy: Option<PathBuf>,
+        /// Persist tool pins here, so a definition changed between runs is caught too.
+        #[arg(long)]
+        pins: Option<PathBuf>,
         /// Largest accepted frame in bytes; a bigger one stops the gateway.
         #[arg(long, default_value_t = 64 * 1024 * 1024)]
         max_message_bytes: usize,
@@ -52,12 +60,25 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
     match cli.cmd {
         Cmd::Run {
             log,
+            policy,
+            pins,
             max_message_bytes,
             command,
         } => {
             let audit = log
                 .map(|p| Audit::create(&p).with_context(|| format!("opening {}", p.display())))
                 .transpose()?;
+            let policy = match policy {
+                Some(p) => Policy::from_toml(&read(&p)?)
+                    .with_context(|| format!("parsing {}", p.display()))?,
+                None => Policy::default(),
+            };
+            let loaded_pins = match &pins {
+                Some(p) if p.exists() => Pins::from_json(&read(p)?)
+                    .with_context(|| format!("parsing {}", p.display()))?,
+                _ => Pins::default(),
+            };
+            let gateway = Gateway::new(policy, loaded_pins);
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?;
@@ -65,7 +86,9 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
                 relay::Config {
                     command,
                     max_message_bytes,
+                    pins_path: pins,
                 },
+                gateway,
                 audit,
             ));
             // Stdin is read on a blocking thread that may never return if the client keeps it
@@ -79,4 +102,8 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
             Ok(0)
         }
     }
+}
+
+fn read(path: &std::path::Path) -> anyhow::Result<String> {
+    std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))
 }

@@ -87,3 +87,52 @@ fn passes_through_server_exit_code() {
         .unwrap();
     assert_eq!(status.code(), Some(3));
 }
+
+#[test]
+fn denied_call_is_answered_by_the_gateway() {
+    let policy = temp_path("policy.toml");
+    std::fs::write(&policy, "default = \"deny\"\n[tools.allowed]\n").unwrap();
+    let meta = r#""_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}"#;
+    let allowed = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"allowed",{meta}}}}}"#
+    );
+    let denied = format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"other",{meta}}}}}"#
+    );
+    let input = format!("{allowed}\n{denied}\n");
+    let (out, code) = echo_through(input.as_bytes(), &["--policy", policy.to_str().unwrap()]);
+    assert_eq!(code, 0);
+
+    // `cat` echoes what reached it, so the allowed call comes back verbatim and the denied one
+    // is replaced by the gateway's tool error.
+    let lines: Vec<serde_json::Value> = String::from_utf8(out)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 2);
+    let (echo, reply) = if lines[0]["id"] == 1 {
+        (&lines[0], &lines[1])
+    } else {
+        (&lines[1], &lines[0])
+    };
+    assert_eq!(echo["method"], "tools/call");
+    assert_eq!(reply["id"], 2);
+    assert_eq!(reply["result"]["isError"], true);
+    assert_eq!(reply["result"]["resultType"], "complete");
+}
+
+#[test]
+fn pins_are_written_to_disk() {
+    let pins = temp_path("pins.json");
+    // `cat` turns the request into its own "response", which is enough to exercise pinning:
+    // the gateway matches the echoed id to the pending tools/list.
+    let list = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","result":{"tools":[{"name":"t","description":"d"}]}}"#;
+    let (_, code) = echo_through(
+        format!("{list}\n").as_bytes(),
+        &["--pins", pins.to_str().unwrap()],
+    );
+    assert_eq!(code, 0);
+    let saved = std::fs::read_to_string(&pins).unwrap();
+    assert!(saved.contains("\"t\""));
+}
